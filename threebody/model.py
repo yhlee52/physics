@@ -20,7 +20,7 @@ class SimplePINN(nn.Module):
 
 # Trainer  
 class Trainer:
-    def __init__(self, model, train_loader, valid_loader, optimizer, scheduler, device='cuda'):
+    def __init__(self, model, train_loader, valid_loader, optimizer, scheduler, device):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.valid_loader = valid_loader
