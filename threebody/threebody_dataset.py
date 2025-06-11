@@ -1,93 +1,107 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from scipy.integrate import solve_ivp
 
-# 중력 상수
-G = 1.0
+def leapfrog_batch(pos, vel, dt, n_steps, G=1.0):
+    """
+    pos, vel : (B, 3, 2)  - x,z 좌표만
+    dt       : float
+    n_steps  : int
+    bulk 심플렉틱 leapfrog 적분 (batch 처리)
+    """
+    for _ in range(n_steps):
+        # ----- half-step 위치 업데이트 -----
+        pos_half = pos + 0.5 * dt * vel
 
-def three_body_derivatives(t, state):
-    x1, z1, x2, z2, x3, z3 = state[0:6]
-    vx1, vz1, vx2, vz2, vx3, vz3 = state[6:12]
-    
-    r12 = np.array([x2 - x1, z2 - z1])
-    r13 = np.array([x3 - x1, z3 - z1])
-    r23 = np.array([x3 - x2, z3 - z2])
-    
-    d12 = np.linalg.norm(r12)
-    d13 = np.linalg.norm(r13)
-    d23 = np.linalg.norm(r23)
-    
-    F12 = G * r12 / d12**3
-    F13 = G * r13 / d13**3
-    F23 = G * r23 / d23**3
-    
-    ax1 = F12[0] + F13[0]
-    az1 = F12[1] + F13[1]
-    ax2 = -F12[0] + F23[0]
-    az2 = -F12[1] + F23[1]
-    ax3 = -F13[0] - F23[0]
-    az3 = -F13[1] - F23[1]
-    
-    derivatives = np.array([
-        vx1, vz1, vx2, vz2, vx3, vz3,
-        ax1, az1, ax2, az2, ax3, az3
-    ])
-    return derivatives
+        # ----- 가속도 계산 -----
+        r12 = pos_half[:,1] - pos_half[:,0]
+        r13 = pos_half[:,2] - pos_half[:,0]
+        r23 = pos_half[:,2] - pos_half[:,1]
 
-def simulate_three_body(initial_positions, initial_velocities, t_eval):
-    initial_state = np.concatenate([
-        initial_positions.flatten(),
-        initial_velocities.flatten()
-    ])
-    
-    t_span = (0, t_eval)
-    
-    sol = solve_ivp(
-        fun=three_body_derivatives,
-        t_span=t_span,
-        y0=initial_state,
-        method='RK45',
-        rtol=1e-9,
-        atol=1e-9
-    )
-    
-    final_state = sol.y[:, -1]
-    
-    final_positions = final_state[:6].reshape(3, 2)
-    final_velocities = final_state[6:12].reshape(3, 2)
-    
-    final_state_combined = np.concatenate([final_positions, final_velocities], axis=1)  # (3, 4)
-    return final_state_combined
+        d12 = np.linalg.norm(r12, axis=1, keepdims=True)
+        d13 = np.linalg.norm(r13, axis=1, keepdims=True)
+        d23 = np.linalg.norm(r23, axis=1, keepdims=True)
 
-class ThreeBodyDataset(Dataset):
-    def __init__(self, num_samples_per_t, x_range, v_range, t_range, dt):
+        a1 = ( r12/(d12**3) +  r13/(d13**3)) * G
+        a2 = (-r12/(d12**3) +  r23/(d23**3)) * G
+        a3 = (-r13/(d13**3) -  r23/(d23**3)) * G
+        acc = np.stack([a1, a2, a3], axis=1)      # (B,3,2)
+
+        # ----- 속도 full-step -----
+        vel = vel + dt * acc
+
+        # ----- 위치 half-step 마무리 -----
+        pos = pos_half + 0.5 * dt * vel
+    return pos, vel
+
+
+class ThreeBodyFastDataset(Dataset):
+    """
+    빠른 벡터화+LeapFrog 기반 삼체 데이터셋
+    · num_samples      : 샘플 수
+    · t_max, dt        : 통합 종료 시간, time-step
+    · pos_range, vel_range : (min,max) 튜플
+    """
+    def __init__(self,
+                 num_samples    = 10000,
+                 t_max          = 2.0,
+                 dt             = 0.01,
+                 pos_range      = (-1.0, 1.0),
+                 vel_range      = (-0.5, 0.5),
+                 seed           = None):
         super().__init__()
+        rng = np.random.default_rng(seed)
 
-        self.t_vals = np.arange(t_range[0], t_range[1] + dt, dt)
-        self.data = []
-        self.labels = []
+        # --- 초기 조건 생성 ---
+        self.t_array = rng.uniform(0.0, t_max, size=(num_samples, 1))  # 예측 시점 t
+        self.init_pos = rng.uniform(*pos_range, size=(num_samples, 3, 2))
+        self.init_vel = rng.uniform(*vel_range, size=(num_samples, 3, 2))
 
-        for t in self.t_vals:
-            for _ in range(num_samples_per_t):
-                positions = np.random.uniform(x_range[0], x_range[1], size=(3, 2))  # (x, z) per body
-                velocities = np.random.uniform(v_range[0], v_range[1], size=(3, 2))  # (u, w) per body
+        # --- 시뮬레이션 (벡터화) ---
+        n_steps_max = int(t_max / dt)
+        # 한 번에 전체를 돌리면 메모리가 클 수 있으므로 1024단위 batch로 나눔
+        batch_size = 1024
+        final_pos  = []
+        final_vel  = []
 
-                # 입력: 초기 위치, 초기 속도, 시간 t
-                x_input = np.concatenate([positions.flatten(), velocities.flatten(), [t]])
+        for i in range(0, num_samples, batch_size):
+            b_end = min(i+batch_size, num_samples)
+            pos = self.init_pos[i:b_end].copy()
+            vel = self.init_vel[i:b_end].copy()
+            # 각 샘플별 step 수 다름 → 가장 큰 n_steps만큼 돌리고, 중간에 필요한 step에서 값 저장
+            steps_needed = (self.t_array[i:b_end] / dt).astype(int)
+            max_steps_b  = steps_needed.max()
+            snapshots_pos = []
+            snapshots_vel = []
 
-                # 출력: t 시점의 위치 + 속도
-                y_output = self.simulate_three_body(positions, velocities, t)
-                self.data.append(x_input)
-                self.labels.append(y_output.flatten())
+            for s in range(max_steps_b):
+                pos, vel = leapfrog_batch(pos, vel, dt, 1)  # 한 step
+                take = (steps_needed.squeeze() == (s+1))
+                if take.any():
+                    snapshots_pos.append(pos[take])
+                    snapshots_vel.append(vel[take])
 
-        self.data = np.stack(self.data)
-        self.labels = np.stack(self.labels)
+            # 순서 보존
+            final_pos.append(np.concatenate(snapshots_pos, axis=0))
+            final_vel.append(np.concatenate(snapshots_vel, axis=0))
+
+        self.final_pos = np.concatenate(final_pos, axis=0)
+        self.final_vel = np.concatenate(final_vel, axis=0)
 
     def __len__(self):
-        return self.num_samples
+        return len(self.t_array)
 
     def __getitem__(self, idx):
-        x = torch.tensor(self.data[idx], dtype=torch.float32)
-        y = torch.tensor(self.labels[idx], dtype=torch.float32)
-        return x, y
+        x_input = np.concatenate([
+            self.init_pos[idx].flatten(),
+            self.init_vel[idx].flatten(),
+            self.t_array[idx]
+        ])
+        y_output = np.concatenate([
+            self.final_pos[idx].flatten(),
+            self.final_vel[idx].flatten()
+        ])
+        return (
+            torch.tensor(x_input, dtype=torch.float32),
+            torch.tensor(y_output, dtype=torch.float32)
+        )

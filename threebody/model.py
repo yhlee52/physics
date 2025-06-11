@@ -20,7 +20,7 @@ class SimplePINN(nn.Module):
 
 # Trainer  
 class Trainer:
-    def __init__(self, model, train_loader, valid_loader, optimizer, scheduler, device='cuda'):
+    def __init__(self, model, train_loader, valid_loader, optimizer, scheduler, device):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.valid_loader = valid_loader
@@ -79,11 +79,11 @@ class Trainer:
 
             #if epoch % 10 == 0 or epoch == 1:
             print(f"Train losses"
-                    f"[Epoch {epoch:04d}] "
-                    f"Total: {total_loss:.6f}, "
-                    f"Data: {total_data_loss:.6f}, "
-                    f"Physics: {total_physics_loss:.6f}, "
-                    f"Hamiltonian: {total_hamiltonian_loss:.6f}")
+                f"[Epoch {epoch:04d}] "
+                f"Total: {total_loss:.6f}, "
+                f"Data: {total_data_loss:.6f}, "
+                f"Physics: {total_physics_loss:.6f}, "
+                f"Hamiltonian: {total_hamiltonian_loss:.6f}")
             
             # Valid
             self.model.eval()
